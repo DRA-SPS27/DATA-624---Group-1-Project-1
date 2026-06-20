@@ -1,6 +1,6 @@
 ---
 title: "Group 1 - Project 1 Technical Appendix"
-author: "Denise Atherley"
+author: "Barakat Adigun, Blessing Anoroh, Denise Atherley, Brandon Chanderban"
 format: docx
 editor: visual
 ---
