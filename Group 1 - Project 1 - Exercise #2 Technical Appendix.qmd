@@ -1,0 +1,257 @@
+---
+title: "Group 1 - Project 1 - Exercise #2 Technical Appendix"
+author: "Barakat Adigun, Blessing Anoroh, Denise Atherley, Brandon Chanderban"
+format: docx
+editor: visual
+---
+
+## Data Management and Architecture
+
+### Data Acquisition & Preparation:
+
+To ensure an auditable and reproducible workflow, the raw HealthLink data was converted from a .txt file to a .csv file and reformatted using Excel Power Query and manual manipulation. It was then stored in a public repository to be ingested, structured into a `tsibble` using the `yearmonth` index, and stored as a clean R object prior to analysis.
+
+```{r}
+# 1. Load Required Libraries
+# Note: Ensure you have installed any missing package beforehand
+library(tidyverse)
+library(tsibble)
+library(lubridate)
+library(feasts)
+library(fable)
+library(patchwork)
+
+# 2. Data Ingestion and Formatting
+# Read the raw data (Raw text file provided was converted to a CSV file named 'student_texas_healthlink_raw.csv' and saved in a public repository for reproduciblity)
+url <- "https://raw.githubusercontent.com/DRA-SPS27/DATA-624---Group-1-Project-1/refs/heads/main/student%20texas%20healthlink%20raw.csv"
+raw_data <- read_csv(url)
+
+# Clean and convert to a time series object (tsibble) and create COVID dummy
+hl_data <- raw_data %>%
+  mutate(
+    # Convert 'm/d/yyyy' format to Date, then to yearmonth for fpp3
+    month = mdy(month), 
+    Month = yearmonth(month),
+    #COVID dummy: 1 during peak disruption (Mar 2020 - Feb 2021, 0 otherwise)
+    covid_shock = if_else(month >= yearmonth("2020-03") & month <= yearmonth("2021-02"), 1, 0)
+  ) %>%
+  select(-row, -month) %>% # Drop unnecessary columns
+  as_tsibble(index = Month, key = clinic)
+
+# Hierarchical Setup
+  # Aggregate data to view individual clinics and the system-wide total
+hl_hierarchy <- hl_data %>%
+  aggregate_key(clinic, visits = sum(visits), covid_shock = max(covid_shock))
+
+```
+
+## Analytics, Modeling & Forecasting
+
+### Exploratory Data Analysis:
+
+Now that the dates have been converted to a time-series object and the hierarchy aggregated. We will plot the system total versus the individual clinics and show an STL decomposition plot to visualize the trend and seasonality.
+
+```{r}
+# 3. Exploratory Data Analysis (EDA)
+p1 <- hl_hierarchy %>%
+  filter(is_aggregated(clinic)) %>%
+  autoplot(visits) +
+  labs(title = "System-Wide Total Visits", y = "Visits", x = "Month") +
+  theme_minimal()
+
+p2 <- hl_hierarchy %>%
+  filter(!is_aggregated(clinic)) %>%
+  autoplot(visits) +
+  labs(title = "Visits by Clinic", y = "Visits", x = "Month") +
+  theme_minimal()
+
+# STL Decomposition to identify underlying Trend, Seasonality, and Remainders
+stl_plot <- hl_hierarchy %>%
+  filter(is_aggregated(clinic)) %>%
+  model(STL(visits ~ trend(window = 21) + season(window = "periodic"))) %>%
+  components() %>%
+  autoplot() +
+  labs(title = "STL Decomposition: System Total") +
+  theme_minimal()
+```
+
+### Model Selection:
+
+We tested three distinct modeling architectures:
+
+- **ETS (Error, Trend, Seasonality):** Exponential smoothing model that served as our baseline
+
+- **ARIMA:** Auto-Regressive Integrated Moving Average model that included a dummy variable for the COVID-19 shock (covid_shock = 1 from March 2020 through February 2021.
+
+- **TSLM:** Time series linear regression model utilizing trend, seasonal dummy variables, and the COVID dummy variable.
+
+```{r}
+# 4. Model Training & Cross Validation
+# Split data: Train (2016-2022) to test against 2023
+# Use filter_index() to safely slice the tsibble without namespace conflicts
+train_data <- hl_hierarchy %>% filter_index(. ~ "2022-12")
+test_data  <- hl_hierarchy %>% filter_index("2023-01" ~ "2023-12")
+
+# 5. Model Fitting (Base Models)
+# We fit multiple models to the training data
+fit_models <- train_data %>%
+  model(
+    # Baseline: ETS (Purely endogenous, cannot use dummy)
+    ets = ETS(visits),
+    # Champion Candidate: ARIMA with COVID dummy variable
+    arima = ARIMA(visits ~ covid_shock),
+    # Alternative: Regression with trend, season, and dummy
+    tslm = TSLM(visits ~ trend() + season() + covid_shock)
+  )
+```
+
+### Cross-Validation & Reconciliation:
+
+To evaluate model stability, we utilized time-series cross-validation by holding out the final year of actual data (2023). Models were trained on 2016–2022 data and evaluated on their ability to predict the hidden 2023 set using Root Mean Squared Error (RMSE) and Mean Absolute Percentage Error (MAPE).
+
+Furthermore, because Texas HealthLink operates in a hierarchical structure (System Total -\> Individual Clinics), we utilized **Minimum Trace (MinT) reconciliation**. This mathematically ensures that the bottom-up clinic forecasts sum perfectly to the system-wide total, leveraging information from the whole network to improve individual clinic accuracy.
+
+```{r}
+# 6. Forecast Reconciliation (MinT)
+# Ensure clinic totals sum to the system total optimally
+reconciled_models <- fit_models %>%
+  mutate(
+    mint_arima = min_trace(arima, method = "mint_shrink")
+  )
+
+# 7. Model Evaluation (Validation on 2023 Holdout)
+# Create future dataframe for 2023 containing the dummy variable (0 in 2023)
+future_2023 <- test_data %>% select(clinic, Month, covid_shock)
+
+# Forecast the test set
+fc_test <- reconciled_models %>% forecast(new_data = future_2023)
+
+# Calculate error metrics (RMSE, MAE, MAPE) to justify champion model
+accuracy_results <- accuracy(fc_test, hl_hierarchy) %>%
+  arrange(clinic, .model)
+
+# View accuracy results 
+print(accuracy_results)
+```
+
+### Champion Model:
+
+Based on validation metrics, the **MinT Reconciled ARIMA with COVID Dummy** was selected as the champion model. It successfully isolated the pandemic surge, maintained stable seasonal parameters, and generated the lowest RMSE on the 2023 holdout set.
+
+```{r}
+# 8. Final Champion Model Forecasting for 2024
+# Refit the chosen structure (MinT Reconciled ARIMA) on the FULL historical dataset
+final_fit <- hl_hierarchy %>%
+  model(arima = ARIMA(visits ~ covid_shock)) %>%
+  mutate(mint = min_trace(arima, method = "mint_shrink"))
+
+# Generate 12-month ahead forecast for 2024
+# Create future exogenous dummy data for 2024 (COVID shock = 0)
+future_2024 <- hl_hierarchy %>%
+  new_data(12) %>%
+  mutate(covid_shock = 0)
+
+final_forecast <- final_fit %>%
+  forecast(new_data = future_2024)
+```
+
+## Forecasting Visuals:
+
+Clean Visuals created to be included in Board level summary document.
+
+```{r}
+# 9. Generate Board-Ready Visuals
+# System-Wide Forecast Chart
+final_system_plot <- final_forecast %>%
+  filter(is_aggregated(clinic), .model == "mint") %>%
+  autoplot(hl_hierarchy, level = c(80, 95)) +
+  labs(title = "12-Month System-Wide Patient Demand Forecast (2024)", 
+       subtitle = "Reconciled ARIMA Model adjusting for COVID-19 Shock",
+       y = "Predicted Total Visits", x = "Date") +
+  theme_minimal()
+
+# Clinic-Level Forecast Chart
+final_clinic_plot <- final_forecast %>%
+  filter(!is_aggregated(clinic), .model == "mint") %>%
+  autoplot(hl_hierarchy, level = 95) +
+  facet_wrap(~clinic, scales = "free_y") +
+  labs(title = "12-Month Demand Forecast by Clinic (2024)", 
+       y = "Predicted Visits", x = "Date") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Display plots
+print(final_system_plot)
+print(final_clinic_plot)
+```
+
+## Final Numbers:
+
+Code to calculate exact numbers for predictions.
+
+```{r}
+# Extracting Exact Numbers for Board Memo
+
+# 1. Filter the forecast object to just the system total for the champion model
+system_2024_summary <- final_forecast %>%
+  filter(is_aggregated(clinic), .model == "mint") %>%
+  as_tibble() %>%
+  # Extract just the month and the point forecast (.mean)
+  select(Month, predicted_visits = .mean) %>%
+  # Round to the nearest whole patient visit
+  mutate(predicted_visits = round(predicted_visits, 0))
+
+# 2. Calculate the Total, Peak, and Lowest values
+total_2024 <- sum(system_2024_summary$predicted_visits)
+peak_month <- system_2024_summary %>% filter(predicted_visits == max(predicted_visits))
+lowest_month <- system_2024_summary %>% filter(predicted_visits == min(predicted_visits))
+
+# 3. Print the results clearly to the console
+cat("\n2024 SYSTEM-WIDE FORECAST SUMMARY\n")
+cat("Total Expected 2024 Visits:", format(total_2024, big.mark = ","), "\n")
+cat("Peak Demand Month:", as.character(peak_month$Month), "(Expected:", format(peak_month$predicted_visits, big.mark = ","), "visits)\n")
+cat("Lowest Demand Month:", as.character(lowest_month$Month), "(Expected:", format(lowest_month$predicted_visits, big.mark = ","), "visits)\n")
+```
+
+```{r}
+# Generate the Exact Board Memo Sentence
+
+# Calculate actual system-wide total for 2023
+total_2023 <- hl_hierarchy %>%
+  filter(is_aggregated(clinic)) %>%
+  filter_index("2023-01" ~ "2023-12") %>%
+  pull(visits) %>%
+  sum(na.rm = TRUE)
+
+# Calculate projected system-wide total for 2024
+total_2024 <- final_forecast %>%
+  filter(is_aggregated(clinic), .model == "mint") %>%
+  as_tibble() %>%
+  pull(.mean) %>%
+  sum(na.rm = TRUE)
+
+# Calculate percentage growth
+growth_pct <- ((total_2024 - total_2023) / total_2023) * 100
+
+# Find the two clinics driving the most demand in 2024
+top_clinics <- final_forecast %>%
+  filter(!is_aggregated(clinic), .model == "mint") %>%
+  as_tibble() %>%
+  group_by(clinic) %>%
+  summarise(predicted_visits = sum(.mean)) %>%
+  arrange(desc(predicted_visits)) %>%
+  head(2)
+
+clinic_A <- as.character(top_clinics$clinic[1])
+clinic_B <- as.character(top_clinics$clinic[2])
+
+# Print the final, formatted sentence for the memo
+cat("\nSUMMARY STATEMENT\n")
+cat(sprintf(
+  "Based on our analysis of monthly visit data from 2016 through 2023, system-wide demand is projected to grow by %.1f%% in 2024, reaching approximately %s total visits, driven heavily by demand in %s and %s.\n",
+  growth_pct,
+  format(round(total_2024, 0), big.mark = ","),
+  clinic_A,
+  clinic_B
+))
+```
