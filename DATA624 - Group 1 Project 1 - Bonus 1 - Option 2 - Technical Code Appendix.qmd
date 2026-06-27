@@ -1,0 +1,460 @@
+---
+title: "Technical Code Appendix: Classical Forecasting and XGBoost Machine Learning Forecasting"
+subtitle: "Group 1 – Project 1 – Bonus #1"
+authors: "Barakat Adigun, Blessing Anoroh, Denise Atherley, Brandon Chanderban"
+date:   "June 26, 2026"
+format:
+  html:
+    toc: true
+    code-fold: show
+    theme: flatly
+  docx: default
+execute:
+  echo:    true
+  warning: false
+---
+
+# Bonus Question 1 Part 2 - Modern ML / Deep Learning Forecasting Comparison
+
+This bonus will serve to extend the Exercise #2 HealthLink forecasting workflow by way of applying a modern machine learning model to the same monthly clinic-visit dataset. Moreover, since the bonus requires ML forecasts for each clinic and the system total, along with a comparison against the classical forecasting workflow, the code below shall first recreate the core data preparation steps from Exercise #2 before fitting and evaluating an XGBoost model.
+
+```{r load-libraries}
+
+# Load the packages required for data preparation, forecasting, machine learning, visualization, and model evaluation.
+library(tidyverse)
+library(lubridate)
+library(tsibble)
+library(fable)
+library(feasts)
+library(fabletools)
+library(slider)
+library(xgboost)
+library(patchwork)
+```
+
+##  Data Import and Preparation
+
+In this section, the HealthLink dataset is imported from the group's public GitHub repository in order to preserve reproducibility. The monthly date field is converted into a usable time index, and a COVID shock indicator is created to mirror the structure originally utilized with the Exercise #2 workflow.
+
+```{r import-and-prepare-data}
+
+# Store the public GitHub URL so that the workflow can be reproduced without relying upon a local file path.
+url <- "https://raw.githubusercontent.com/DRA-SPS27/DATA-624---Group-1-Project-1/refs/heads/main/student%20texas%20healthlink%20raw.csv"
+
+# Import the HealthLink dataset from the public repository.
+raw_data <- read_csv(url, show_col_types = FALSE)
+
+# Clean the raw data, convert the month field into a monthly time index, and create the COVID shock indicator used in the forecasting models.
+hl_data <- raw_data %>%
+  mutate(
+    month_date = mdy(month),
+    Month = yearmonth(month_date),
+    covid_shock = if_else(
+      month_date >= ymd("2020-03-01") & month_date <= ymd("2021-02-28"),
+      1, 0
+    )
+  ) %>%
+  select(clinic, Month, month_date, visits, covid_shock) %>%
+  arrange(clinic, Month)
+
+# Convert the cleaned dataset into a tsibble for time-series modeling.
+hl_tsibble <- hl_data %>%
+  select(clinic, Month, visits, covid_shock) %>%
+  as_tsibble(index = Month, key = clinic)
+
+# Create the clinic hierarchy so that forecasts can be evaluated at both the clinic level and the system-wide level.
+hl_hierarchy <- hl_tsibble %>%
+  aggregate_key(clinic, visits = sum(visits), covid_shock = max(covid_shock))
+```
+
+## Classical Forecasting Benchmark
+
+The following chunk of code serves to recreate the classical benchmark models from within Exercise #2. ETS, ARIMA with a COVID dummy, and also TSLM are trained on the 2016 to 2022 period and evaluated against the 2023 holdout year. This in turn provides a baseline against which the ML model will later be compared.
+
+```{r recreate-classical-forecasting-benchmarks}
+
+# Split the data into training and testing periods. Models are trained through 2022 and validated against 2023.
+train_data <- hl_hierarchy %>%
+  filter_index(. ~ "2022-12")
+
+test_data <- hl_hierarchy %>%
+  filter_index("2023-01" ~ "2023-12")
+
+# Fit the classical benchmark models used for comparison: ETS, ARIMA with the COVID shock variable, and TSLM.
+fit_models <- train_data %>%
+  model(
+    ets = ETS(visits),
+    arima = ARIMA(visits ~ covid_shock),
+    tslm = TSLM(visits ~ trend() + season() + covid_shock)
+  )
+
+# Apply MinT reconciliation to the ARIMA model so clinic-level forecasts remain consistent with the system-wide total.
+reconciled_models <- fit_models %>%
+  mutate(
+    mint_arima = min_trace(arima, method = "mint_shrink")
+  )
+
+# Create the future data frame required for models using the COVID indicator.
+future_2023 <- test_data %>%
+  select(clinic, Month, covid_shock)
+
+# Generate forecasts for the 2023 holdout period.
+fc_test <- reconciled_models %>%
+  forecast(new_data = future_2023)
+
+# Calculate accuracy measures for the classical models.
+classical_accuracy <- accuracy(fc_test, hl_hierarchy) %>%
+  as_tibble() %>%
+  select(.model, clinic, RMSE, MAE, MAPE)
+
+print(classical_accuracy)
+```
+
+## Feature Engineering for the ML Model
+
+Unlike the case with the ARIMA and ETS models, XGBoost does not automatically understand the time-series structure. As such, the time-series information thus has to be translated into features such as lagged visits, rolling averages, month indicators, year indicators, and the COVID shock variable.
+
+```{r conduct-feature-engineering}
+
+# Define a function to create the features required for XGBoost. These include calendar variables, lagged visits, and rolling averages.
+create_ml_features <- function(data) {
+  data %>%
+    arrange(clinic, Month) %>%
+    group_by(clinic) %>%
+    mutate(
+      month_num = month(as.Date(Month)),
+      year_num = year(as.Date(Month)),
+      time_index = row_number(),
+      lag_1 = lag(visits, 1),
+      lag_2 = lag(visits, 2),
+      lag_3 = lag(visits, 3),
+      lag_6 = lag(visits, 6),
+      lag_12 = lag(visits, 12),
+      roll_mean_3 = slide_dbl(visits, mean, .before = 2, .complete = TRUE),
+      roll_mean_6 = slide_dbl(visits, mean, .before = 5, .complete = TRUE)
+    ) %>%
+    ungroup()
+}
+
+# Apply the feature engineering function and remove rows with missing values that are created by the lag and rolling average calculations.
+ml_data <- create_ml_features(hl_data) %>%
+  drop_na()
+
+# Use observations through 2022 to train the ML model.
+train_ml <- ml_data %>%
+  filter(Month <= yearmonth("2022 Dec"))
+```
+
+## XGBoost Model Training
+
+The following chunk fits a global XGBoost model across all of the clinics. Instead of fitting a separate model for each of the clinics, the clinic name shall be included as a predictor, thus allowing the model to learn both system-wide patterns and clinic-specific differences.
+
+```{r train-the-xgboost-model}
+
+# Specify the predictor set used by the XGBoost model. The clinic field is included so one global model can learn clinic-specific patterns.
+x_formula <- ~ clinic + month_num + year_num + time_index + covid_shock +
+  lag_1 + lag_2 + lag_3 + lag_6 + lag_12 + roll_mean_3 + roll_mean_6
+
+# Convert the predictor variables into a numeric matrix required by xgboost.
+x_train <- model.matrix(x_formula, data = train_ml)[, -1]
+y_train <- train_ml$visits
+
+# Set a seed so that the model training results are reproducible.
+set.seed(624)
+
+# Train the XGBoost regression model using squared error loss.
+xgb_fit <- xgboost(
+  data = x_train,
+  label = y_train,
+  nrounds = 250,
+  max_depth = 3,
+  eta = 0.05,
+  subsample = 0.85,
+  colsample_bytree = 0.85,
+  objective = "reg:squarederror",
+  verbose = 0
+)
+```
+
+## Recursive Forecasting Functions
+
+Because the future lagged values are not known in advance, the ML forecasts are as such generated recursively. In this, each predicted month is added back into the history and then used to construct the features for the next forecast month.
+
+```{r construct-recursive-functions}
+
+# Create one row of future features for each clinic for a given forecast month.
+make_future_features <- function(history_data, forecast_month) {
+  
+# Ensure the forecast month is stored using the same yearmonth format as the historical data.
+  forecast_month <- yearmonth(forecast_month)
+  
+  map_dfr(unique(history_data$clinic), function(clinic_name) {
+    
+# Pull the historical data for the clinic being forecasted.
+    clinic_history <- history_data %>%
+      filter(clinic == clinic_name) %>%
+      arrange(Month)
+    
+    tibble(
+      clinic = clinic_name,
+      Month = forecast_month,
+      month_date = as.Date(forecast_month),
+      covid_shock = 0,
+      month_num = month(as.Date(forecast_month)),
+      year_num = year(as.Date(forecast_month)),
+      time_index = nrow(clinic_history) + 1,
+      lag_1 = tail(clinic_history$visits, 1),
+      lag_2 = tail(clinic_history$visits, 2)[1],
+      lag_3 = tail(clinic_history$visits, 3)[1],
+      lag_6 = tail(clinic_history$visits, 6)[1],
+      lag_12 = tail(clinic_history$visits, 12)[1],
+      roll_mean_3 = mean(tail(clinic_history$visits, 3)),
+      roll_mean_6 = mean(tail(clinic_history$visits, 6))
+    )
+  })
+}
+
+# Generate multi-step forecasts recursively. Each predicted month is appended to the history and then used to forecast the following month.
+recursive_xgb_forecast <- function(history_data, start_month, h = 12) {
+  
+# Create the sequence of future months to be forecasted.
+  forecast_months <- yearmonth(start_month) + 0:(h - 1)
+  history_extended <- history_data
+  forecast_output <- tibble()
+  
+  for (i in seq_along(forecast_months)) {
+    
+    m <- yearmonth(forecast_months[i])
+    
+# Build features for the current forecast month using the latest available history.
+    new_features <- make_future_features(history_extended, m)
+    x_new <- model.matrix(x_formula, data = new_features)[, -1]
+    
+# Generate XGBoost predictions for the current forecast month.
+    predictions <- predict(xgb_fit, x_new)
+    
+    month_forecast <- new_features %>%
+      mutate(
+        Month = yearmonth(Month),
+        predicted_visits = round(predictions, 0)
+      ) %>%
+      select(clinic, Month, predicted_visits)
+    
+    forecast_output <- bind_rows(forecast_output, month_forecast)
+    
+# Add the newly forecasted values back into the history so they can be used as lagged inputs for later forecast months.
+    history_extended <- bind_rows(
+      history_extended,
+      month_forecast %>%
+        mutate(
+          Month = yearmonth(Month),
+          visits = predicted_visits,
+          month_date = as.Date(Month),
+          covid_shock = 0
+        ) %>%
+        select(clinic, Month, month_date, visits, covid_shock)
+    )
+  }
+  
+  forecast_output
+}
+```
+
+## ML Validation on the 2023 Holdout Data
+
+Next, the model is tested against the 2023 holdout period data in order to compare its accuracy to the classical models. This in turn mirrors the validation approach executed within Exercise #2.
+
+```{r conduct-validation-test}
+
+# Use data through 2022 as the historical base for validating 2023 forecasts.
+history_through_2022 <- hl_data %>%
+  filter(Month <= yearmonth("2022 Dec"))
+
+# Produce recursive XGBoost forecasts for the 2023 holdout period.
+xgb_2023_forecast <- recursive_xgb_forecast(
+  history_data = history_through_2022,
+  start_month = "2023 Jan",
+  h = 12
+)
+
+# Extract the actual 2023 visits for comparison against the ML forecasts.
+actual_2023 <- hl_data %>%
+  filter(Month >= yearmonth("2023 Jan"),
+         Month <= yearmonth("2023 Dec")) %>%
+  select(clinic, Month, actual_visits = visits)
+
+# Calculate clinic-level ML accuracy measures for 2023.
+xgb_2023_accuracy <- xgb_2023_forecast %>%
+  left_join(actual_2023, by = c("clinic", "Month")) %>%
+  group_by(clinic) %>%
+  summarise(
+    RMSE = sqrt(mean((actual_visits - predicted_visits)^2)),
+    MAE = mean(abs(actual_visits - predicted_visits)),
+    MAPE = mean(abs((actual_visits - predicted_visits) / actual_visits)) * 100,
+    .groups = "drop"
+  ) %>%
+  mutate(.model = "xgboost")
+
+# Sum clinic forecasts to the system level and calculate system-wide accuracy.
+xgb_2023_system_accuracy <- xgb_2023_forecast %>%
+  group_by(Month) %>%
+  summarise(predicted_visits = sum(predicted_visits), .groups = "drop") %>%
+  left_join(
+    actual_2023 %>%
+      group_by(Month) %>%
+      summarise(actual_visits = sum(actual_visits), .groups = "drop"),
+    by = "Month"
+  ) %>%
+  summarise(
+    clinic = "System Total",
+    RMSE = sqrt(mean((actual_visits - predicted_visits)^2)),
+    MAE = mean(abs(actual_visits - predicted_visits)),
+    MAPE = mean(abs((actual_visits - predicted_visits) / actual_visits)) * 100
+  ) %>%
+  mutate(.model = "xgboost")
+
+# Combine clinic-level and system-wide ML accuracy results.
+xgb_accuracy <- bind_rows(xgb_2023_accuracy, xgb_2023_system_accuracy)
+
+print(xgb_accuracy)
+```
+
+## 2024 ML Forecasts
+
+After validation, the XGBoost model was used to generate the 12-month ahead forecasts for 2024. Forecasts are produced at the clinic level and then summed to obtain a system-wide format/outlook.
+
+```{r conduct-2024-forecasts}
+
+# Generate the final 12-month ahead XGBoost forecasts for 2024.
+xgb_2024_forecast <- recursive_xgb_forecast(
+  history_data = hl_data,
+  start_month = "2024 Jan",
+  h = 12
+)
+
+# Aggregate clinic-level ML forecasts to produce the system-wide forecast.
+xgb_2024_system <- xgb_2024_forecast %>%
+  group_by(Month) %>%
+  summarise(predicted_visits = sum(predicted_visits), .groups = "drop")
+
+print(xgb_2024_forecast)
+print(xgb_2024_system)
+```
+
+## 2024 Forecast Summaries
+
+The following tables summarize the 2024 ML forecasts by both the clinic and overall system levels. The outputs will be useful for the executive comparison document to be created since they provide facets such as the expected demand levels, the average monthly demand, and also the peak demand periods.
+
+```{r generate-forecast-summaries}
+
+# Summarize total annual demand, average monthly demand, and peak demand for each clinic.
+xgb_clinic_summary_2024 <- xgb_2024_forecast %>%
+  group_by(clinic) %>%
+  summarise(
+    forecast_2024_visits = sum(predicted_visits),
+    average_monthly_visits = mean(predicted_visits),
+    peak_month = Month[which.max(predicted_visits)],
+    peak_visits = max(predicted_visits),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(forecast_2024_visits))
+
+# Summarize the same forecast information at the system-wide level.
+xgb_system_summary_2024 <- xgb_2024_system %>%
+  summarise(
+    forecast_2024_total = sum(predicted_visits),
+    average_monthly_visits = mean(predicted_visits),
+    peak_month = Month[which.max(predicted_visits)],
+    peak_visits = max(predicted_visits),
+    lowest_month = Month[which.min(predicted_visits)],
+    lowest_visits = min(predicted_visits)
+  )
+
+print(xgb_clinic_summary_2024)
+print(xgb_system_summary_2024)
+```
+
+## Comparison of Accuracy: Classical vs. ML
+
+This next section will serve to compare the XGBoost model against the classical forecasting models from within Exercise #2. Since the comparison will be done based upon the 2023 holdout accuracy, it will allow for a fairer basis for evaluating whether or not the ML model offered an actual improved forecasting performance.
+
+```{r compare-model-accuracy}
+
+# Average the classical model accuracy results across clinics and the system total.
+classical_summary <- classical_accuracy %>%
+  group_by(.model) %>%
+  summarise(
+    RMSE = mean(RMSE, na.rm = TRUE),
+    MAE = mean(MAE, na.rm = TRUE),
+    MAPE = mean(MAPE, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Summarize XGBoost accuracy in the same format as the classical models.
+xgb_summary <- xgb_accuracy %>%
+  summarise(
+    .model = "xgboost",
+    RMSE = mean(RMSE, na.rm = TRUE),
+    MAE = mean(MAE, na.rm = TRUE),
+    MAPE = mean(MAPE, na.rm = TRUE)
+  )
+
+# Combine classical and ML accuracy summaries for direct comparison.
+accuracy_comparison <- bind_rows(classical_summary, xgb_summary) %>%
+  arrange(RMSE)
+
+print(accuracy_comparison)
+```
+
+## Forecast Visualizations
+
+These final plots will aim to visualize the 2024 XGBoost forecasts by clinic and for the system as a whole. The graphics are intended to buttress the executive-facing comparison by showing how the ML model projects future demand.
+
+```{r generate-visualizations}
+
+# Plot the 2024 XGBoost forecasts separately for each clinic.
+p_xgb_clinic <- xgb_2024_forecast %>%
+  ggplot(aes(x = as.Date(Month), y = predicted_visits)) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~ clinic, scales = "free_y") +
+  labs(
+    title = "XGBoost 12-Month Patient Demand Forecast by Clinic (2024)",
+    x = "Month",
+    y = "Predicted Visits"
+  ) +
+  theme_minimal()
+
+# Plot the 2024 system-wide XGBoost forecast.
+p_xgb_system <- xgb_2024_system %>%
+  ggplot(aes(x = as.Date(Month), y = predicted_visits)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "XGBoost 12-Month System-Wide Patient Demand Forecast (2024)",
+    x = "Month",
+    y = "Predicted Total Visits"
+  ) +
+  theme_minimal()
+
+print(p_xgb_clinic)
+print(p_xgb_system)
+```
+
+## Variable Importance
+
+Finally, the variable importance output will be produced to provide some interpretability around the XGBoost model. Whilst XGBoost may be interpreted as somewhat less transparent than ARIMA or ETS, this output helps indicate which of the engineered features contributed most heavily to the model's predictions.
+
+```{r determine-variable-importance}
+
+# Calculate variable importance to identify which engineered features contributed most to the XGBoost model.
+importance_matrix <- xgb.importance(
+  feature_names = colnames(x_train),
+  model = xgb_fit
+)
+
+print(importance_matrix)
+
+# Visualize the feature importance results.
+xgb.plot.importance(importance_matrix)
+```
